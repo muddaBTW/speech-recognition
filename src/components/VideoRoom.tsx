@@ -13,12 +13,13 @@ import {
   Stethoscope,
   User2,
   Video,
-  Volume2,
 } from "lucide-react";
 
 interface Message {
   id: string;
   senderName: string;
+  senderRole?: "doctor" | "patient";
+  sourceLanguage?: string;
   text: string;
   translatedText?: string;
   translatedLanguage?: string;
@@ -64,6 +65,9 @@ export default function VideoRoom({ roomId, userName, role }: VideoRoomProps) {
   const [targetLang, setTargetLang] = useState("hi-IN");
   
   const recognitionRef = useRef<any>(null);
+  const recognitionRestartTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const manualStopRef = useRef(false);
+  const lastSpeechErrorRef = useRef<string | null>(null);
   const zegoInstanceRef = useRef<any>(null);
   const isRecordingRef = useRef(false);
   const messagesRef = useRef<Message[]>([]);
@@ -77,11 +81,14 @@ export default function VideoRoom({ roomId, userName, role }: VideoRoomProps) {
   useEffect(() => { messagesRef.current = messages; }, [messages]);
   useEffect(() => { targetLangRef.current = targetLang; }, [targetLang]);
 
+  const getDesiredDisplayLanguage = useCallback(() => {
+    return targetLangRef.current;
+  }, []);
+
   // Translation Function (for Patient)
-  const translateMessage = async (msgId: string, text: string) => {
+  const translateMessage = async (msgId: string, text: string, requestedLanguage: string) => {
     const currentMsgs = messagesRef.current;
     const msg = currentMsgs.find(m => m.id === msgId);
-    const requestedLanguage = targetLangRef.current;
 
     if (!msg) {
       return;
@@ -174,6 +181,8 @@ export default function VideoRoom({ roomId, userName, role }: VideoRoomProps) {
     const msgData: Message = {
       id: "th-" + Date.now() + "-" + Math.random().toString(36).substr(2, 5),
       senderName: userName,
+      senderRole: role,
+      sourceLanguage: role === "doctor" ? "en-IN" : targetLangRef.current,
       text: text,
       timestamp: Date.now(),
       isPrescription: isPrescription
@@ -229,18 +238,19 @@ export default function VideoRoom({ roomId, userName, role }: VideoRoomProps) {
     }
   }, [userName, roomId]);
 
-  // Initialize Speech Recognition (for Doctor)
+  // Initialize Speech Recognition for both doctor and patient.
   useEffect(() => {
-    if (typeof window !== "undefined" && role === "doctor") {
+    if (typeof window !== "undefined") {
       const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
       if (SpeechRecognition) {
         const recognition = new SpeechRecognition();
         recognition.continuous = true;
         recognition.interimResults = true;
-        recognition.lang = "en-IN";
+        recognition.lang = role === "doctor" ? "en-IN" : targetLangRef.current;
 
         recognition.onstart = () => {
           console.log("TeleHealth: [SPEECH] Mic Started");
+          lastSpeechErrorRef.current = null;
           setTranscribeStatus("listening");
         };
 
@@ -261,18 +271,40 @@ export default function VideoRoom({ roomId, userName, role }: VideoRoomProps) {
         };
 
         recognition.onerror = (event: any) => {
-          if (event.error !== 'no-speech') {
-             console.error("TeleHealth: [SPEECH] Error:", event.error);
-             setTranscribeStatus("error");
+          lastSpeechErrorRef.current = event.error;
+
+          if (event.error === "no-speech") {
+            return;
           }
-          // 'no-speech' is safe to ignore and shouldn't trigger error overlays
+
+          if (event.error === "aborted") {
+            console.warn("TeleHealth: [SPEECH] Aborted");
+            return;
+          }
+
+          console.error("TeleHealth: [SPEECH] Error:", event.error);
+          setTranscribeStatus("error");
         };
 
         recognition.onend = () => {
           console.log("TeleHealth: [SPEECH] Ended");
+
+          if (manualStopRef.current) {
+            manualStopRef.current = false;
+            lastSpeechErrorRef.current = null;
+            setTranscribeStatus("idle");
+            return;
+          }
+
+          if (lastSpeechErrorRef.current === "aborted") {
+            setIsRecording(false);
+            setTranscribeStatus("idle");
+            return;
+          }
+
           if (isRecordingRef.current) {
             console.log("TeleHealth: [SPEECH] Service closed. Auto-restarting...");
-            setTimeout(() => {
+            recognitionRestartTimeoutRef.current = setTimeout(() => {
               if (isRecordingRef.current) {
                 try { recognition.start(); } catch (e) {
                    console.error("TeleHealth: [SPEECH] Restart blocked:", e);
@@ -287,7 +319,31 @@ export default function VideoRoom({ roomId, userName, role }: VideoRoomProps) {
         recognitionRef.current = recognition;
       }
     }
-  }, [role, userName, sendMessage]);
+    return () => {
+      if (recognitionRestartTimeoutRef.current) {
+        clearTimeout(recognitionRestartTimeoutRef.current);
+        recognitionRestartTimeoutRef.current = null;
+      }
+
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.onstart = null;
+          recognitionRef.current.onresult = null;
+          recognitionRef.current.onerror = null;
+          recognitionRef.current.onend = null;
+          recognitionRef.current.stop();
+        } catch {}
+      }
+
+      recognitionRef.current = null;
+    };
+  }, [role, sendMessage]);
+
+  useEffect(() => {
+    if (recognitionRef.current) {
+      recognitionRef.current.lang = role === "doctor" ? "en-IN" : targetLang;
+    }
+  }, [role, targetLang]);
 
   const toggleRecording = () => {
     if (!recognitionRef.current) {
@@ -296,9 +352,11 @@ export default function VideoRoom({ roomId, userName, role }: VideoRoomProps) {
     }
     
     if (isRecording) {
+      manualStopRef.current = true;
       setIsRecording(false);
       recognitionRef.current.stop();
     } else {
+      lastSpeechErrorRef.current = null;
       setIsRecording(true);
       try {
         recognitionRef.current.start();
@@ -309,46 +367,33 @@ export default function VideoRoom({ roomId, userName, role }: VideoRoomProps) {
     }
   };
   
-  // Auto-translate every prescription to the patient's currently selected language.
+  // Auto-translate incoming voice notes into the local user's reading language.
   useEffect(() => {
-    if (role !== "patient" || messages.length === 0) {
+    if (messages.length === 0) {
       return;
     }
 
+    const desiredLanguage = getDesiredDisplayLanguage();
+
     messages.forEach((message) => {
+      const sourceLanguage = message.sourceLanguage ?? (message.senderRole === "doctor" ? "en-IN" : targetLang);
+      const isIncomingVoiceNote = message.isPrescription && message.senderRole !== role;
       const needsTranslation =
-        message.isPrescription &&
+        isIncomingVoiceNote &&
         !message.isTranslating &&
         (!!message.text?.trim()) &&
+        sourceLanguage !== desiredLanguage &&
         (
           !message.translatedText ||
-          message.translatedLanguage !== targetLang
+          message.translatedLanguage !== desiredLanguage
         );
 
       if (needsTranslation) {
-        console.log("TeleHealth: Auto-translating prescription:", message.id, "->", targetLang);
-        void translateMessage(message.id, message.text);
+        console.log("TeleHealth: Auto-translating prescription:", message.id, "->", desiredLanguage);
+        void translateMessage(message.id, message.text, desiredLanguage);
       }
     });
-  }, [messages, role, targetLang]);
-
-  // Play Audio Function (for Patient)
-  const playAudio = async (text: string) => {
-    try {
-      const res = await fetch("/api/tts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, targetLanguage: targetLangRef.current }),
-      });
-      const data = await res.json();
-      if (data.audios && data.audios[0]) {
-        const audio = new Audio(`data:audio/wav;base64,${data.audios[0]}`);
-        audio.play();
-      }
-    } catch (error) {
-      console.error("TTS fail", error);
-    }
-  };
+  }, [getDesiredDisplayLanguage, messages, role, targetLang]);
 
   const initZego = async () => {
     if (joiningRef.current || isJoined) return;
@@ -451,7 +496,7 @@ export default function VideoRoom({ roomId, userName, role }: VideoRoomProps) {
             </button>
           )}
 
-          {role === "doctor" && isJoined && (
+          {isJoined && (
             <button
               onClick={toggleRecording}
               className={`flex items-center gap-2 px-6 py-2.5 rounded-full font-bold transition-all shadow-lg active:scale-95 ${
@@ -461,11 +506,11 @@ export default function VideoRoom({ roomId, userName, role }: VideoRoomProps) {
               }`}
             >
               {isRecording ? <MicOff size={18} /> : <Mic size={18} />}
-              {isRecording ? "Stop Voice" : "Prescribe by Voice"}
+              {isRecording ? "Stop Voice" : role === "doctor" ? "Prescribe by Voice" : "Speak to Doctor"}
             </button>
           )}
 
-          {role === "patient" && (
+          {isJoined && (
             <div className="flex items-center gap-2 bg-slate-700/50 backdrop-blur-md px-3 py-2 rounded-xl border border-white/10">
               <Languages size={16} className="text-blue-400" />
               <select
@@ -529,7 +574,7 @@ export default function VideoRoom({ roomId, userName, role }: VideoRoomProps) {
               </div>
             )}
             
-            {tempTranscript && role === "doctor" && (
+            {tempTranscript && isJoined && (
               <div className="bg-blue-500/10 border border-blue-500/20 rounded-2xl p-4 animate-in fade-in slide-in-from-top-2 duration-300">
                 <div className="flex items-center justify-between mb-2">
                   <div className="flex items-center gap-2">
@@ -550,14 +595,14 @@ export default function VideoRoom({ roomId, userName, role }: VideoRoomProps) {
               </div>
             )}
             
-            {transcribeStatus === "listening" && !tempTranscript && role === "doctor" && (
+            {transcribeStatus === "listening" && !tempTranscript && isJoined && (
               <div className="flex items-center gap-2 px-4 py-2 bg-slate-800/50 rounded-xl border border-white/5 animate-pulse">
                 <div className="w-1.5 h-1.5 rounded-full bg-green-500" />
                 <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Microphone Active - Speak now</span>
               </div>
             )}
 
-            {transcribeStatus === "error" && role === "doctor" && (
+            {transcribeStatus === "error" && isJoined && (
               <div className="flex items-center gap-2 px-4 py-3 bg-red-500/10 rounded-xl border border-red-500/20">
                 <div className="w-1.5 h-1.5 rounded-full bg-red-500" />
                 <span className="text-[10px] font-bold text-red-400 uppercase tracking-widest leading-none">Microphone Error - Check permissions</span>
@@ -565,7 +610,6 @@ export default function VideoRoom({ roomId, userName, role }: VideoRoomProps) {
             )}
             
             {messages.filter(m => m.isPrescription).map((msg) => {
-              console.log("TeleHealth: Rendering prescription:", msg.id);
               return (
                 <div key={msg.id} className="relative group animate-in fade-in slide-in-from-bottom-2 duration-500">
                   <div className="absolute -left-2 top-0 bottom-0 w-1 bg-blue-500 rounded-full opacity-0 group-hover:opacity-100 transition-opacity shadow-[0_0_10px_rgba(59,130,246,0.5)]" />
@@ -579,13 +623,12 @@ export default function VideoRoom({ roomId, userName, role }: VideoRoomProps) {
                        <span className="text-[10px] font-medium text-slate-600">{new Date(msg.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
                     </div>
                     
-                    {/* Primary Display: Translated for patient, Original for doctor */}
+                    {/* Primary Display: show translated incoming notes for the local user */}
                     <p className="text-sm text-slate-200 leading-relaxed font-medium">
-                       {role === "patient" && msg.translatedText ? msg.translatedText : msg.text}
+                       {msg.senderRole !== role && msg.translatedText ? msg.translatedText : msg.text}
                     </p>
 
-                    {/* Secondary Display: Original english for patient if translated */}
-                    {role === "patient" && msg.translatedText && (
+                    {msg.senderRole !== role && msg.translatedText && (
                       <p className="mt-2 text-[10px] text-slate-500 italic leading-relaxed">
                         Original: {msg.text}
                       </p>
@@ -598,17 +641,6 @@ export default function VideoRoom({ roomId, userName, role }: VideoRoomProps) {
                       </div>
                     )}
 
-                    {msg.translatedText && role === "patient" && (
-                      <div className="mt-4 pt-4 border-t border-white/5 animate-in slide-in-from-top-1 duration-300">
-                        <button
-                          onClick={() => playAudio(msg.translatedText!)}
-                          className="w-full flex items-center justify-center gap-2 py-2 px-3 bg-green-600 hover:bg-green-500 text-white rounded-xl text-[10px] font-black uppercase tracking-wider transition-all shadow-lg shadow-green-500/10 active:scale-95"
-                        >
-                          <Volume2 size={12} />
-                          Hear Prescription
-                        </button>
-                      </div>
-                    )}
                   </div>
                 </div>
               );
