@@ -56,6 +56,18 @@ const extractPayloadText = (msgObj: any): string | null => {
   return null;
 };
 
+const isSecureWebRtcOrigin = () => {
+  if (typeof window === "undefined") return true;
+
+  const host = window.location.hostname;
+  const isLocalhost =
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    host === "::1";
+
+  return window.isSecureContext || isLocalhost;
+};
+
 export default function VideoRoom({ roomId, userName, role }: VideoRoomProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [isRecording, setIsRecording] = useState(false);
@@ -397,6 +409,12 @@ export default function VideoRoom({ roomId, userName, role }: VideoRoomProps) {
 
   const initZego = async () => {
     if (joiningRef.current || isJoined) return;
+
+    if (!isSecureWebRtcOrigin()) {
+      alert("WebRTC requires HTTPS or localhost. Open this app on https:// or on http://localhost.");
+      console.error("TeleHealth: WebRTC requires HTTPS or localhost");
+      return;
+    }
     
     const appID = Number(process.env.NEXT_PUBLIC_ZEGOCLOUD_APP_ID);
     const serverSecret = process.env.NEXT_PUBLIC_ZEGOCLOUD_SERVER_SECRET as string;
@@ -478,7 +496,21 @@ export default function VideoRoom({ roomId, userName, role }: VideoRoomProps) {
           <button
             onClick={() => {
               const url = window.location.origin + window.location.pathname.replace(`/${roomId}`, `/${roomId}`);
-              navigator.clipboard.writeText(url);
+              if (navigator.clipboard?.writeText) {
+                navigator.clipboard.writeText(url);
+                alert("Room link copied! Send this to the other person.");
+                return;
+              }
+
+              const textArea = document.createElement("textarea");
+              textArea.value = url;
+              textArea.setAttribute("readonly", "");
+              textArea.style.position = "absolute";
+              textArea.style.left = "-9999px";
+              document.body.appendChild(textArea);
+              textArea.select();
+              document.execCommand("copy");
+              document.body.removeChild(textArea);
               alert("Room link copied! Send this to the other person.");
             }}
             className="flex items-center gap-2 px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all border border-white/5 active:scale-95"
