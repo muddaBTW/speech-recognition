@@ -7,35 +7,34 @@ Realtime telemedicine room with:
 - Sarvam translation
 - multilingual prescription display
 
-## Local setup
+## Quick Start
 
-1. Install dependencies:
+This project is pre-configured for a hackathon demo. API keys are already included in `.env`, so you can just run it.
 
-```bash
-npm install
-```
 
-2. Make sure the environment variables are available in `.env` / `.env.local`.
+1. **Install dependencies**:
 
-Required values:
+   ```bash
+   npm install
+   ```
 
-```env
-NEXT_PUBLIC_ZEGOCLOUD_APP_ID=
-NEXT_PUBLIC_ZEGOCLOUD_SERVER_SECRET=
-SARVAM_API_KEY=
-```
+2. **Run the development server**:
 
-3. Start the app:
+   ```bash
+   npm run dev
+   ```
 
-```bash
-npm run dev
-```
+3. **Open the app**:
+   Go to [http://localhost:3000](http://localhost:3000)
 
-4. Open:
+4. **Start the app**:
 
-```text
-http://localhost:3000
-```
+   ```bash
+   npm run dev
+   ```
+
+5. **Open the app**:
+   Go to [http://localhost:3000](http://localhost:3000)
 
 ## Important runtime note
 
